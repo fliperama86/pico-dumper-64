@@ -1,0 +1,9 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Pico Dumper 64
+This is a simple tool to dump N64 cartridges from a custom made circuit based on the Raspberry PI Pico
+
+- [n64.py](mdc:src/n64.py) contains the micropython implementation
