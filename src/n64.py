@@ -1,7 +1,9 @@
+import uasyncio
+import sys
 from machine import Pin
 from utime import sleep_us
 import os
-
+import time
 cart_size = 12
 rom_base_address = 0x10000000
 file_path = "dump.n64"
@@ -153,72 +155,55 @@ def get_cart_size_from_db(checksum_str):
                         if db_checksum == checksum_str:
                             try:
                                 size_mb = int(parts[1])
-                                print(f"Found cart size in DB: {size_mb} MB")
                                 return size_mb
                             except ValueError:
-                                print(f"Warning: Invalid size format in DB for checksum {checksum_str}")
-                                # Continue searching in case of multiple entries? Or return 0?
-                                # Let's return 0 for this entry and continue searching for safety.
+                                pass # Add pass if needed, although returning 0 below handles this case
 
                 except Exception as e:
-                    print(f"Error processing line in {N64_DB_PATH}: {e}")
                     # Decide whether to break or try to continue
                     break # Safer to stop if the format is unexpected
 
     except OSError as e:
         if e.errno == 2: # ENOENT
-            print(f"Warning: Database file '{N64_DB_PATH}' not found.")
+            pass # Added pass for empty block
         else:
-            print(f"Error opening database file '{N64_DB_PATH}': {e}")
+            pass # Added pass for empty block
 
-    print("Cart size not found in DB.")
     return 0 # Return 0 if not found or error occurred
 
-max_file_size = 1024 * 1024
-def read_cart():
-  buffer_size = 100 * 1024
-  # Try to remove the old file, but ignore error if it doesn't exist
-  try:
-    os.remove(file_path)
-  except OSError as e:
-    if e.errno != 2: # errno 2 is ENOENT (No such file or directory)
-        raise # Re-raise unexpected errors
-  
-  with open(file_path, 'wb') as file:
-    write_buffer = bytearray(buffer_size)
-    offset = 0
-    progress = 0
+async def read_cart():
+  writer = uasyncio.StreamWriter(sys.stdout, {})
 
-    # Read the data in 512 byte chunks
-    for rom_address in range(rom_base_address, rom_base_address + (cart_size * 1024 * 1024), 512):
+  # Calculate total size based on global cart_size
+  total_bytes = cart_size * 1024 * 1024
+  end_address = rom_base_address + total_bytes
+
+  # Read the data in 512 byte chunks
+  for rom_address in range(rom_base_address, end_address, 512):
       # Set the address for the next 512 bytes
       set_address(rom_address)
 
+      # Create a buffer for this chunk
+      chunk_buffer = bytearray(512)
+
       for bufferIndex in range(0, 512, 2):
-        word = read_word()
-        write_buffer[bufferIndex + offset] = word >> 8
-        write_buffer[bufferIndex + offset + 1] = word & 0xFF
+          word = read_word()
+          # Note: Order is high byte first for N64 ROMs
+          chunk_buffer[bufferIndex] = word >> 8
+          chunk_buffer[bufferIndex + 1] = word & 0xFF
       
-      offset += 512
+      # Write chunk to USB output asynchronously
+      writer.write(chunk_buffer)
+      await writer.drain() # Ensure data is flushed
       
-      if (offset >= buffer_size):
-        file.write(write_buffer)
-        offset = 0
-      
-      # Report progress
       if (rom_address & 0x3FFF) == 0:
         led_pin.high()
-        print(f'Progress: {progress:.0f}%', end='\r')
-        progress += (0x3FFF / max_file_size) * 100
       else:
         led_pin.low()
-    
-      if (file.tell() >= max_file_size):
-        print('')
-        print("Done!                                    ")
-        break
+  
+  led_pin.low() 
 
-def main():
+async def main():
   global cart_size # Declare intent to modify global variable
 
   setup_cart()
@@ -230,26 +215,19 @@ def main():
   except UnicodeDecodeError:
       cart_name = "Invalid Name Encoding"
 
-  print('Cart Name:', cart_name)
-  print('Checksum:', checksum)
-
   # Attempt to get size from DB
   db_size = get_cart_size_from_db(checksum)
   if db_size > 0:
       cart_size = db_size
-      # Update max_file_size based on detected cart size
-      global max_file_size
-      max_file_size = cart_size * 1024 * 1024
   else:
-      print(f"Using default cart size: {cart_size} MB")
       # Keep the default cart_size = 12 defined globally
-      # Update max_file_size based on default cart size
-      global max_file_size
-      max_file_size = cart_size * 1024 * 1024
+      pass # Add pass to fix indentation error
 
-  print('Dumping cart...')
-  setup_cart() # Re-setup in case DB reading took time? Or is it needed? Let's keep it for now.
-  read_cart()
+  setup_cart() # Re-setup might still be useful
   
-main()
+  time.sleep(10)
+  
+  await read_cart() # Call async function
+
+uasyncio.run(main())
 

@@ -1,0 +1,1 @@
+stty -f /dev/cu.usbmodem2101  raw && cat /dev/cu.usbmodem2101  > my_dump_raw.n64
