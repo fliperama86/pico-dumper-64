@@ -40,45 +40,29 @@ echo "Using source directory: $SOURCE_DIR"
 echo "Targeting destination: $DEST_DIR on Pico"
 echo "Using rshell command: $RSHELL_CMD"
 
-# --- Deployment Logic ---
-if [ "$DEPLOY_MODE" == "source_only" ]; then
-    # Deploy only n64.py
-    SOURCE_FILE="$SOURCE_DIR/n64.py"
-    TARGET_FILE="n64.py" # Filename on Pico
-    REMOTE_PATH="$DEST_DIR$TARGET_FILE"
-    echo "Deploying source only: $TARGET_FILE"
 
-    if [ ! -f "$SOURCE_FILE" ]; then
-        echo "Error: Source file '$SOURCE_FILE' not found." >&2
-        exit 1
+echo "Deploying files from $SOURCE_DIR"
+# Find files in the source directory and copy them
+# Using null-terminated output/input for safety with special filenames
+find "$SOURCE_DIR" -maxdepth 1 -type f -print0 | while IFS= read -r -d $'\0' file; do
+    filename=$(basename "$file")
+
+    if [ "$DEPLOY_MODE" == "source_only" ]; then
+        if [ "$filename" == "n64.txt" ]; then
+            continue
+        fi
     fi
 
-    echo "Copying '$TARGET_FILE' to '$REMOTE_PATH'..."
-    $RSHELL_CMD cp "$SOURCE_FILE" "$REMOTE_PATH"
+    remote_path="$DEST_DIR$filename"
+
+    echo "Copying '$filename' to '$remote_path'..."
+    $RSHELL_CMD cp "$file" "$remote_path"
 
     if [ $? -ne 0 ]; then
-        echo "Error copying '$TARGET_FILE'. Deployment failed." >&2
-        exit 1
+        echo "Error copying '$filename'. Deployment failed." >&2
+        exit 1 # Exit on first error
     fi
-
-else
-    # Deploy all files
-    echo "Deploying all files from $SOURCE_DIR"
-    # Find files in the source directory and copy them
-    # Using null-terminated output/input for safety with special filenames
-    find "$SOURCE_DIR" -maxdepth 1 -type f -print0 | while IFS= read -r -d $'\0' file; do
-        filename=$(basename "$file")
-        remote_path="$DEST_DIR$filename"
-
-        echo "Copying '$filename' to '$remote_path'..."
-        $RSHELL_CMD cp "$file" "$remote_path"
-
-        if [ $? -ne 0 ]; then
-            echo "Error copying '$filename'. Deployment failed." >&2
-            exit 1 # Exit on first error
-        fi
-    done
-fi
+done
 
 # Check if the loop finished without errors (only relevant for 'all' mode)
 if [ $? -ne 0 ] && [ "$DEPLOY_MODE" != "source_only" ]; then
