@@ -1,15 +1,12 @@
+from machine import Pin
+from utime import sleep_us
+import os
 
-from machine import Pin, UART
-from utime import sleep_us, sleep_ms
-from time import sleep
-import sys
-
-# Constants
+cart_size = 12
 rom_base_address = 0x10000000
+file_path = "dump.n64"
 led_pin = Pin("LED", Pin.OUT)
 
-# Pin configurations
-# pico_pins_map = [28, 27, 26, 22, 21, 20, 19, 18, 9, 8, 7, 6, 5, 4, 3, 2]
 pico_pins_map = [0, 1, 2, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10, 9, 8]
 address_pins = [Pin(i, Pin.OUT) for i in pico_pins_map]
 
@@ -21,9 +18,6 @@ ale_high_pin = Pin(26, Pin.OUT)
 
 reset_pin = Pin(16, Pin.OUT)
 
-# Setup UART for USB communication
-uart = UART(0, baudrate=115200)
-
 def setup_cart():
   # Set Address Pins to Output and set them low
   set_pico_address_pins_out()
@@ -33,7 +27,6 @@ def setup_cart():
     pin.init(Pin.OUT)
 
   # Pull RESET(PH0) low until we are ready
-  reset_pin.low()
   
   # Output a high signal on WR(PH5) RD(PH6), pins are active low therefore
   # everything is disabled now
@@ -101,7 +94,14 @@ def read_word():
   read_pin.high()
   return word
 
+def print_hex(data):
+  for i in range(0, len(data), 16):
+    line = data[i:i+16]
+    hex_line = ' '.join(f'{byte:02X}' for byte in line)
+    print(hex_line)
+
 def get_cart_id():
+  """Reads the first 64 bytes of the cartridge header."""
   set_address(rom_base_address)
   buffer = bytearray(64)
   for i in range(0, 64, 2):
@@ -110,118 +110,146 @@ def get_cart_id():
     high_byte = word >> 8
     buffer[i] = high_byte
     buffer[i + 1] = low_byte
-  return buffer
 
-def detect_cart_size():
-  """Detect cart size by checking for mirroring of ROM data"""
-  print("Detecting cart size...")
-  
-  # Get the first 16 bytes as a reference
-  set_address(rom_base_address)
-  reference_data = bytearray(16)
-  for i in range(0, 16, 2):
-    word = read_word()
-    reference_data[i] = word >> 8
-    reference_data[i + 1] = word & 0xFF
-  
-  # Check for mirroring at different sizes (4MB, 8MB, 12MB, 16MB, 32MB, 64MB)
-  sizes_to_check = [4, 8, 12, 16, 32, 64]
-  detected_size = 64  # Default to maximum size if no mirroring detected
-  
-  for size in sizes_to_check:
-    # Calculate address to check for mirroring
-    mirror_address = rom_base_address + (size * 1024 * 1024)
-    
-    # Read data at potential mirror address
-    set_address(mirror_address)
-    mirror_match = True
-    
-    for i in range(0, 16, 2):
-      word = read_word()
-      high_byte = word >> 8
-      low_byte = word & 0xFF
-      
-      # Compare with reference data
-      if high_byte != reference_data[i] or low_byte != reference_data[i + 1]:
-        mirror_match = False
-        break
-    
-    # If we found a mirror, we know the cart size
-    if mirror_match:
-      detected_size = size
-      break
-  
-  print(f"Detected cart size: {detected_size}MB")
-  return detected_size
+  # Extract CRC1 checksum (bytes 0x10-0x13) and format as hex string
+  checksum_bytes = buffer[0x10:0x14]
+  checksum_str = ''.join(f'{b:02X}' for b in checksum_bytes)
 
-def stream_cart_data():
-  """Stream cart data via USB UART"""
-  # Get cart ID and name
-  cart_id = get_cart_id()
+  return buffer, checksum_str
+
+# n64.txt should be placed in the root directory of the Pico's filesystem.
+# Expected format (repeat for each entry):
+# <ROM Name>
+# <Checksum>,<Size>,<SaveType>
+# <Empty Line>
+# Example:
+# THE LEGEND OF ZELDA
+# EDE79053,32,5
+#
+N64_DB_PATH = "n64.txt"
+
+def get_cart_size_from_db(checksum_str):
+    """Looks up the cart size in the n64.txt database using the checksum."""
+    try:
+        with open(N64_DB_PATH, 'r') as db_file:
+            while True:
+                try:
+                    # Skip name line
+                    name_line = db_file.readline()
+                    if not name_line: break # End of file
+
+                    # Read info line (Checksum,Size,SaveType)
+                    info_line = db_file.readline()
+                    if not info_line: break # Unexpected end of file
+
+                    # Skip empty line
+                    empty_line = db_file.readline()
+                    # Allow for EOF after empty line
+                    # if not empty_line: break
+
+                    parts = info_line.strip().split(',')
+                    if len(parts) >= 2:
+                        db_checksum = parts[0]
+                        if db_checksum == checksum_str:
+                            try:
+                                size_mb = int(parts[1])
+                                print(f"Found cart size in DB: {size_mb} MB")
+                                return size_mb
+                            except ValueError:
+                                print(f"Warning: Invalid size format in DB for checksum {checksum_str}")
+                                # Continue searching in case of multiple entries? Or return 0?
+                                # Let's return 0 for this entry and continue searching for safety.
+
+                except Exception as e:
+                    print(f"Error processing line in {N64_DB_PATH}: {e}")
+                    # Decide whether to break or try to continue
+                    break # Safer to stop if the format is unexpected
+
+    except OSError as e:
+        if e.errno == 2: # ENOENT
+            print(f"Warning: Database file '{N64_DB_PATH}' not found.")
+        else:
+            print(f"Error opening database file '{N64_DB_PATH}': {e}")
+
+    print("Cart size not found in DB.")
+    return 0 # Return 0 if not found or error occurred
+
+max_file_size = 1024 * 1024
+def read_cart():
+  buffer_size = 100 * 1024
+  # Try to remove the old file, but ignore error if it doesn't exist
   try:
-    cart_name = cart_id[32:42].decode('utf-8').strip()
-  except:
-    cart_name = "UNKNOWN"
-  print(f'Cart Name: {cart_name}')
+    os.remove(file_path)
+  except OSError as e:
+    if e.errno != 2: # errno 2 is ENOENT (No such file or directory)
+        raise # Re-raise unexpected errors
   
-  # Detect cart size
-  cart_size = detect_cart_size()
-  
-  # Send cart info to host
-  uart.write(f"CART_INFO:{cart_name},{cart_size}\n".encode())
-  
-  # Wait for host to be ready
-  print("Waiting for host...")
-  while True:
-    if uart.any():
-      cmd = uart.readline().decode().strip() # type: ignore
-      if cmd == "START_DUMP":
+  with open(file_path, 'wb') as file:
+    write_buffer = bytearray(buffer_size)
+    offset = 0
+    progress = 0
+
+    # Read the data in 512 byte chunks
+    for rom_address in range(rom_base_address, rom_base_address + (cart_size * 1024 * 1024), 512):
+      # Set the address for the next 512 bytes
+      set_address(rom_address)
+
+      for bufferIndex in range(0, 512, 2):
+        word = read_word()
+        write_buffer[bufferIndex + offset] = word >> 8
+        write_buffer[bufferIndex + offset + 1] = word & 0xFF
+      
+      offset += 512
+      
+      if (offset >= buffer_size):
+        file.write(write_buffer)
+        offset = 0
+      
+      # Report progress
+      if (rom_address & 0x3FFF) == 0:
+        led_pin.high()
+        print(f'Progress: {progress:.0f}%', end='\r')
+        progress += (0x3FFF / max_file_size) * 100
+      else:
+        led_pin.low()
+    
+      if (file.tell() >= max_file_size):
+        print('')
+        print("Done!                                    ")
         break
-      sleep_ms(100)
-  
-  print("Dumping cart...")
-  
-  # Buffer for reading data
-  buffer_size = 512
-  buffer = bytearray(buffer_size)
-  
-  # Calculate total size in bytes
-  total_size = cart_size * 1024 * 1024
-  
-  # Read and stream the data
-  for rom_address in range(rom_base_address, rom_base_address + total_size, buffer_size):
-    # Set the address for the next chunk
-    set_address(rom_address)
-    
-    # Read data into buffer
-    for i in range(0, buffer_size, 2):
-      word = read_word()
-      buffer[i] = word >> 8
-      buffer[i + 1] = word & 0xFF
-    
-    # Send data over UART
-    uart.write(buffer)
-    
-    # Report progress
-    progress = ((rom_address - rom_base_address) / total_size) * 100
-    if (rom_address & 0x3FFF) == 0:
-      led_pin.high()
-      print(f'Progress: {progress:.1f}%', end='\r')
-    else:
-      led_pin.low()
-  
-  print("\nDump completed!")
-  uart.write(b"DUMP_COMPLETE\n")
 
 def main():
-  try:
-    setup_cart()
-    stream_cart_data()
-  except Exception as e:
-    print(f"Error: {e}")
-    # Print exception details
-    sys.print_exception(e) if hasattr(sys, 'print_exception') else print(f"Exception details: {e}")
+  global cart_size # Declare intent to modify global variable
 
-if __name__ == "__main__":
-  main()
+  setup_cart()
+  cart_header, checksum = get_cart_id()
+  cart_name_bytes = cart_header[32:52] # Read up to 20 bytes for name
+  # Clean up potential padding/garbage in name
+  try:
+      cart_name = cart_name_bytes.decode('utf-8').rstrip('\x00').strip()
+  except UnicodeDecodeError:
+      cart_name = "Invalid Name Encoding"
+
+  print('Cart Name:', cart_name)
+  print('Checksum:', checksum)
+
+  # Attempt to get size from DB
+  db_size = get_cart_size_from_db(checksum)
+  if db_size > 0:
+      cart_size = db_size
+      # Update max_file_size based on detected cart size
+      global max_file_size
+      max_file_size = cart_size * 1024 * 1024
+  else:
+      print(f"Using default cart size: {cart_size} MB")
+      # Keep the default cart_size = 12 defined globally
+      # Update max_file_size based on default cart size
+      global max_file_size
+      max_file_size = cart_size * 1024 * 1024
+
+  print('Dumping cart...')
+  setup_cart() # Re-setup in case DB reading took time? Or is it needed? Let's keep it for now.
+  read_cart()
+  
+main()
 
